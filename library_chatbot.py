@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import hashlib
 import streamlit as st
 from pathlib import Path
 
@@ -12,7 +13,6 @@ try:
     __import__("pysqlite3")
     sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 except Exception:
-    # pysqlite3가 없거나 교체가 불필요한 환경이면 그대로 진행
     pass
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -25,30 +25,47 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories.streamlit import StreamlitChatMessageHistory
 from langchain_chroma import Chroma
 
+
 # -------------------------------------------------------------------
 # ✅ API Key (Streamlit secrets 또는 환경변수에서만 읽기)
 # -------------------------------------------------------------------
 if not os.getenv("OPENAI_API_KEY"):
-    # secrets.toml에 OPENAI_API_KEY가 있는 경우 자동 주입
     if "OPENAI_API_KEY" in st.secrets:
         os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+
+
+# -------------------------------------------------------------------
+# ✅ 유틸: 업로드 PDF 저장 + 해시 만들기
+#    - 같은 파일명이라도 내용이 다르면 다른 DB를 쓰게 하려고 해시 사용
+# -------------------------------------------------------------------
+def save_uploaded_pdf_and_get_hash(uploaded_file) -> tuple[str, str]:
+    data = uploaded_file.getbuffer()
+    file_hash = hashlib.md5(data).hexdigest()  # 간단/충분
+    tmp_dir = Path(".streamlit_tmp")
+    tmp_dir.mkdir(exist_ok=True)
+    pdf_path = str(tmp_dir / f"{file_hash}_{uploaded_file.name}")
+    with open(pdf_path, "wb") as f:
+        f.write(data)
+    return pdf_path, file_hash
+
+
+def get_persist_dir(file_hash_or_name: str) -> str:
+    base = Path("./chroma_db")
+    base.mkdir(exist_ok=True)
+    return str(base / file_hash_or_name)
+
 
 # -------------------------------------------------------------------
 # ✅ 캐시 함수들
 # -------------------------------------------------------------------
-
-
-# ✅ ① 위치 1 : get_persist_dir() 함수 새로 추가
 @st.cache_resource(show_spinner=False)
 def load_and_split_pdf(file_path: str):
     loader = PyPDFLoader(file_path)
     return loader.load_and_split()
 
 
-
-# ✅ ② 위치 2 : build_or_load_vectorstore() 함수 수정
 @st.cache_resource(show_spinner=False)
-def build_or_load_vectorstore(_docs, persist_directory: str = "./chroma_db"):
+def build_or_load_vectorstore(_docs, persist_directory: str):
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
     # 기존 DB가 있으면 로드 시도
@@ -60,33 +77,26 @@ def build_or_load_vectorstore(_docs, persist_directory: str = "./chroma_db"):
             pass
 
     # 새로 생성
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)
     split_docs = text_splitter.split_documents(_docs)
+
     return Chroma.from_documents(
         split_docs,
         embeddings,
         persist_directory=persist_directory,
     )
 
-# ✅ ③ 위치 3 : initialize_chain() 함수 수정
-@st.cache_resource(show_spinner=False)
-def initialize_chain(selected_model: str, pdf_path: str):
 
+@st.cache_resource(show_spinner=False)
+def initialize_chain(selected_model: str, pdf_path: str, persist_dir: str):
+    # 1) PDF -> pages
     pages = load_and_split_pdf(pdf_path)
-    
-    persist_dir = get_persist_dir(pdf_path)   # ⭐ 추가
+
+    # 2) Vector DB
     vectorstore = build_or_load_vectorstore(pages, persist_dir)
-    
     retriever = vectorstore.as_retriever()
 
-
-
-def get_persist_dir(pdf_path: str):
-    pdf_name = Path(pdf_path).stem
-    return f"./chroma_db/{pdf_name}"
-
-
-    # 질문 재구성 프롬프트
+    # 3) 질문 재구성 프롬프트
     contextualize_q_system_prompt = (
         "Given a chat history and the latest user question which might reference context "
         "in the chat history, formulate a standalone question which can be understood "
@@ -101,7 +111,7 @@ def get_persist_dir(pdf_path: str):
         ]
     )
 
-    # QA 프롬프트
+    # 4) QA 프롬프트
     qa_system_prompt = (
         "You are an assistant for question-answering tasks. "
         "Use the following pieces of retrieved context to answer the question. "
@@ -118,11 +128,14 @@ def get_persist_dir(pdf_path: str):
         ]
     )
 
+    # 5) RAG 체인 구성
     llm = ChatOpenAI(model=selected_model)
     history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
     question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
     return rag_chain
+
 
 # -------------------------------------------------------------------
 # ✅ Streamlit UI
@@ -137,25 +150,26 @@ option = st.selectbox("Select GPT Model", ("gpt-4o-mini", "gpt-3.5-turbo-0125"))
 DEFAULT_PDF = "[챗봇프로그램및실습] 부경대학교 규정집.pdf"
 
 uploaded = st.file_uploader("PDF를 업로드하거나, 기본 PDF로 실행하세요.", type=["pdf"])
+
 pdf_path = None
+persist_dir = None
 
 if uploaded is not None:
-    # 업로드 파일은 임시로 저장 후 사용
-    tmp_dir = Path(".streamlit_tmp")
-    tmp_dir.mkdir(exist_ok=True)
-    pdf_path = str(tmp_dir / uploaded.name)
-    with open(pdf_path, "wb") as f:
-        f.write(uploaded.getbuffer())
+    pdf_path, file_hash = save_uploaded_pdf_and_get_hash(uploaded)
+    persist_dir = get_persist_dir(file_hash)
 else:
-    # 기본 파일이 레포에 포함돼 있다면 상대경로로 접근
     if os.path.exists(DEFAULT_PDF):
         pdf_path = DEFAULT_PDF
+        # 기본 PDF는 파일명(stem) 기준으로 persist_dir 생성
+        persist_dir = get_persist_dir(Path(DEFAULT_PDF).stem)
 
-if not pdf_path:
+if not pdf_path or not persist_dir:
     st.info("먼저 PDF를 업로드하시거나, 레포에 기본 PDF 파일을 추가해주세요.")
     st.stop()
 
-rag_chain = initialize_chain(option, pdf_path)
+# ✅ 여기서 반드시 rag_chain이 반환되어야 함 (이게 기존 오류의 핵심)
+rag_chain = initialize_chain(option, pdf_path, persist_dir)
+
 chat_history = StreamlitChatMessageHistory(key="chat_messages")
 
 conversational_rag_chain = RunnableWithMessageHistory(
@@ -177,6 +191,7 @@ if prompt_message := st.chat_input("질문을 입력하세요"):
         with st.spinner("Thinking..."):
             config = {"configurable": {"session_id": "any"}}
             response = conversational_rag_chain.invoke({"input": prompt_message}, config)
+
             answer = response.get("answer", "")
             st.write(answer)
 
@@ -184,4 +199,3 @@ if prompt_message := st.chat_input("질문을 입력하세요"):
                 for doc in response.get("context", []):
                     src = doc.metadata.get("source", "source")
                     st.markdown(src, help=doc.page_content)
-
