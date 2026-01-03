@@ -2,6 +2,7 @@
 import os
 import sys
 import streamlit as st
+from pathlib import Path
 
 # -------------------------------------------------------------------
 # ✅ sqlite3 호환 (Streamlit Cloud 등 일부 환경에서 Chroma가 sqlite3 빌드 이슈를 일으킬 때 대응)
@@ -35,11 +36,17 @@ if not os.getenv("OPENAI_API_KEY"):
 # -------------------------------------------------------------------
 # ✅ 캐시 함수들
 # -------------------------------------------------------------------
+
+
+# ✅ ① 위치 1 : get_persist_dir() 함수 새로 추가
 @st.cache_resource(show_spinner=False)
 def load_and_split_pdf(file_path: str):
     loader = PyPDFLoader(file_path)
     return loader.load_and_split()
 
+
+
+# ✅ ② 위치 2 : build_or_load_vectorstore() 함수 수정
 @st.cache_resource(show_spinner=False)
 def build_or_load_vectorstore(_docs, persist_directory: str = "./chroma_db"):
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
@@ -61,11 +68,23 @@ def build_or_load_vectorstore(_docs, persist_directory: str = "./chroma_db"):
         persist_directory=persist_directory,
     )
 
+# ✅ ③ 위치 3 : initialize_chain() 함수 수정
 @st.cache_resource(show_spinner=False)
 def initialize_chain(selected_model: str, pdf_path: str):
+
     pages = load_and_split_pdf(pdf_path)
-    vectorstore = build_or_load_vectorstore(pages)
+    
+    persist_dir = get_persist_dir(pdf_path)   # ⭐ 추가
+    vectorstore = build_or_load_vectorstore(pages, persist_dir)
+    
     retriever = vectorstore.as_retriever()
+
+
+
+def get_persist_dir(pdf_path: str):
+    pdf_name = Path(pdf_path).stem
+    return f"./chroma_db/{pdf_name}"
+
 
     # 질문 재구성 프롬프트
     contextualize_q_system_prompt = (
@@ -165,3 +184,4 @@ if prompt_message := st.chat_input("질문을 입력하세요"):
                 for doc in response.get("context", []):
                     src = doc.metadata.get("source", "source")
                     st.markdown(src, help=doc.page_content)
+
